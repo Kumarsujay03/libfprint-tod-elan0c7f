@@ -1,0 +1,32 @@
+name: Build
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config \
+            libfprint-2-tod-dev libfprint-2-dev libgusb-dev
+
+      - name: Build the plugin
+        run: make
+
+      - name: Check the plugin exports the TOD entry point
+        run: nm -D --defined-only libfprint-tod-elan0c7f.so | grep -w fpi_tod_shared_driver_get_type
+
+      - name: Check the plugin installs
+        run: make install DESTDIR="$PWD/stage" && find stage -name '*.so'
+
+      - name: Build the score-logging variant and tools
+        run: |
+          make clean
+          make LOG_SCORES=1
+          make match-test list-devices

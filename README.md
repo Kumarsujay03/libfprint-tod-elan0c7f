@@ -1,5 +1,7 @@
 # libfprint-tod-elan0c7f
 
+[![Build](https://github.com/Kumarsujay03/libfprint-tod-elan0c7f/actions/workflows/build.yml/badge.svg)](https://github.com/Kumarsujay03/libfprint-tod-elan0c7f/actions/workflows/build.yml)
+
 A Linux driver for the **ELAN 04f3:0c7f** fingerprint sensor, as fitted to the
 Acer Swift 3 SF314-512. Upstream libfprint does not support this sensor. This
 driver is a [libfprint TOD](https://gitlab.freedesktop.org/3v1n0/libfprint/-/tree/tod)
@@ -87,8 +89,8 @@ Because of this, we suggest using the fingerprint for the **login and lock
 screen only**, and keeping a password for `sudo`, polkit and keyring unlock.
 On Ubuntu, `sudo pam-auth-update` controls where fingerprint login is used.
 
-Do not report security problems in public issues; contact the maintainer
-directly first.
+Please report security problems privately, as described in
+[SECURITY.md](SECURITY.md), not in public issues.
 
 ## Development
 

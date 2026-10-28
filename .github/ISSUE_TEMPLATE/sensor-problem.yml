@@ -1,0 +1,52 @@
+name: Sensor problem
+description: The driver doesn't load, enroll or verify on your machine
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for testing the driver. Please don't attach fingerprint images
+        or raw frames here: they are biometric data and this page is public.
+  - type: input
+    id: laptop
+    attributes:
+      label: Laptop model
+      placeholder: Acer Swift 3 SF314-512
+    validations:
+      required: true
+  - type: input
+    id: distro
+    attributes:
+      label: Distribution and version
+      placeholder: Ubuntu 26.04
+    validations:
+      required: true
+  - type: textarea
+    id: lsusb
+    attributes:
+      label: Output of `lsusb | grep -i elan`
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: versions
+    attributes:
+      label: Package versions
+      description: Output of `dpkg -l | grep -E 'fprint|libfprint'` (or your distribution's equivalent)
+      render: text
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you ran (fprintd-enroll, fprintd-verify, the login screen...) and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: fprintd log
+      description: |
+        Run `sudo systemctl stop fprintd`, then
+        `sudo G_MESSAGES_DEBUG=all /usr/libexec/fprintd -t 2>&1 | tee fprintd.log`,
+        reproduce the problem in another terminal and paste the log here.
+      render: text
