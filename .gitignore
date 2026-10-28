@@ -1,0 +1,13 @@
+# build output
+*.o
+*.so
+/match-test
+/list-devices
+
+# never commit fingerprint data: raw frames, captures, score logs
+*.bin
+*.pgm
+*.png
+*.log
+samples/
+captures/
