@@ -11,6 +11,7 @@
 #   TOD_ROOT=dir   use unpacked -dev packages under dir instead of installed ones
 
 PLUGIN  := libfprint-tod-elan0c7f.so
+UDEVDIR ?= /etc/udev/rules.d
 PKGS    := glib-2.0 gobject-2.0 gio-2.0 gmodule-2.0 gusb
 
 ifdef TOD_ROOT
@@ -45,15 +46,23 @@ match-test: tools/match-test.c matcher.c matcher.h
 list-devices: tools/list-devices.c
 	$(CC) -O2 -Wall -o $@ tools/list-devices.c $(FP_CFLAGS) $(shell pkg-config --cflags --libs glib-2.0 gobject-2.0 gio-2.0) $(filter %libfprint-2.so.2 -lfprint-2,$(FP_LIBS))
 
+# unit test of the learned templates (storage and safeguards)
+check: tools/learn-test.c elan0c7f.c matcher.c matcher.h
+	$(CC) -O0 -g -Wall -Wno-unused-function -I. -o learn-test tools/learn-test.c matcher.c \
+	    $(FP_CFLAGS) $(shell pkg-config --cflags $(PKGS)) $(FP_LIBS) $(shell pkg-config --libs $(PKGS)) -lm
+	rm -rf learn-test.d && mkdir learn-test.d && ./learn-test learn-test.d; \
+	    status=$$?; rm -rf learn-test learn-test.d; exit $$status
+
 install: $(PLUGIN)
 	@test -n "$(TODDIR)" || { echo "libfprint TOD driver directory not found"; exit 1; }
 	install -D -m 644 $(PLUGIN) $(DESTDIR)$(TODDIR)/$(PLUGIN)
-	@echo "Installed. Restart fprintd: sudo systemctl restart fprintd"
+	install -D -m 644 udev/60-elan0c7f-awake.rules $(DESTDIR)$(UDEVDIR)/60-elan0c7f-awake.rules
+	@echo "Installed. Now run: sudo udevadm trigger && sudo systemctl restart fprintd"
 
 uninstall:
-	rm -f $(DESTDIR)$(TODDIR)/$(PLUGIN)
+	rm -f $(DESTDIR)$(TODDIR)/$(PLUGIN) $(DESTDIR)$(UDEVDIR)/60-elan0c7f-awake.rules
 
 clean:
 	rm -f $(PLUGIN) match-test list-devices
 
-.PHONY: all install uninstall clean
+.PHONY: all check install uninstall clean

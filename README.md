@@ -30,8 +30,22 @@ minutiae matching libfprint normally uses. This driver does the following:
   asked for again.
 - **Match.** It compares a new press against each stored press by normalised
   cross-correlation over rotations of ±24° and small shifts, and accepts the
-  best score at or above 0.50. Matching runs on all CPU cores; a whole
-  verify, press included, takes about 1.5 s.
+  best score at or above 0.50. Matching runs on all CPU cores.
+- **Early match.** While a press is still being captured, the first 3 frames
+  are already matched. A clear match (0.62 or more, a stricter bar because
+  fewer frames are averaged) ends the press there; otherwise the full 8-frame
+  check runs as usual. A good press is decided in about 0.3 s.
+- **Learning.** A confident match adds that press to up to 5 extra "learned"
+  templates for the finger, replacing the oldest, so matching adapts to how
+  the finger is really pressed. fprintd only saves prints at enrollment, so
+  the driver keeps these itself, root-only, in
+  `/var/lib/fprint/.elan0c7f-learned/`. Safeguards: the press must match an
+  *enrolled* template (never only a learned one) at 0.65 or more, beat every
+  other finger by 0.20, not be a near-copy of an existing template, and be a
+  clear, well-covered image. Enrolled templates are never changed.
+- **Always ready.** `make install` also adds a udev rule that keeps the sensor
+  out of USB power saving, so the first touch is read at once instead of
+  after a wake-up.
 
 ## Install
 
@@ -43,6 +57,7 @@ sudo apt install build-essential pkg-config fprintd libpam-fprintd \
     libfprint-2-tod1 libfprint-2-tod-dev libfprint-2-dev libgusb-dev
 make
 sudo make install
+sudo udevadm trigger
 sudo systemctl restart fprintd
 ```
 
@@ -53,7 +68,12 @@ The plugin goes into libfprint's TOD driver directory
 fprintd-list $USER
 ```
 
-To remove it: `sudo make uninstall && sudo systemctl restart fprintd`.
+To remove it: `sudo make uninstall && sudo systemctl restart fprintd`. To
+forget what the driver has learned, delete `/var/lib/fprint/.elan0c7f-learned`.
+
+Optional, for a lock screen that reacts at once: start fprintd with
+`--no-timeout` (a systemd drop-in for `fprintd.service`), so it is already
+running when the screen locks.
 
 ## Enroll
 
@@ -81,9 +101,13 @@ Read these before you rely on the sensor:
   0.58–0.73 and other fingers stayed at or below about 0.43, against the
   threshold of 0.50, with no false accepts in about 40 wrong-finger tries.
   That is one person's fingers, not a proper false-accept-rate study.
-- **Templates are images.** The stored templates are cleaned ridge images of
-  your finger, readable by root, as with any image-based libfprint driver.
-  Nothing leaves the machine.
+- **Templates are images.** The stored and learned templates are cleaned
+  ridge images of your finger, readable by root only, as with any image-based
+  libfprint driver. Nothing leaves the machine.
+- **Learning changes what is accepted over time.** It only learns from clear
+  matches against enrolled templates, but if you are worried about a false
+  accept being learned, delete the learned folder; enrolled templates are
+  never affected.
 
 Because of this, we suggest using the fingerprint for the **login and lock
 screen only**, and keeping a password for `sudo`, polkit and keyring unlock.
@@ -102,6 +126,8 @@ Please report security problems privately, as described in
   little-endian 16-bit pixels, one directory per press.
 - `make list-devices` builds a small tool that lists the readers libfprint
   sees.
+- `make check` runs the unit test of the learned templates: storage, slot
+  rotation, file permissions and every learning safeguard.
 - `G_MESSAGES_DEBUG=all` on fprintd shows the driver's debug log.
 
 The USB protocol is the one in libfprint's `elan` driver. Image processing and

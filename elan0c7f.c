@@ -32,6 +32,29 @@
 /* finger frames averaged per press; more did not improve matching on
  * recorded samples and each one costs ~50 ms of contact */
 #define CAPTURE_FRAMES 8
+/* verify and identify also match the first few frames while capture goes
+ * on; a clear match there ends the press ~250 ms sooner. The bar is
+ * stricter than E0C7F_MATCH_THRESHOLD since fewer frames are averaged;
+ * on recorded samples it took 25 of 30 genuine presses and no wrong finger
+ * came within 0.1 of it */
+#define EARLY_FRAMES 3
+#define EARLY_ACCEPT 0.62
+/* Learning: a confident match adds the press to a few extra "learned"
+ * templates for that finger, so matching adapts to how it is really
+ * pressed. fprintd only stores prints at enrollment, so the driver keeps
+ * these itself, next to fprintd's prints. Safeguards: the press must match
+ * an *enrolled* template (never only a learned one) well above the
+ * threshold, clearly beat every other finger, and be a good image; it
+ * replaces the oldest of LEARN_SLOTS learned templates and never an
+ * enrolled one. */
+#define LEARN_DIR "/var/lib/fprint/.elan0c7f-learned"
+#define LEARN_SLOTS 5
+#define LEARN_MIN_SCORE 0.65  /* against an enrolled template */
+#define LEARN_MAX_SCORE 0.90  /* already this close to a template: nothing new */
+#define LEARN_MIN_MARGIN 0.20 /* over the best other finger */
+#define LEARN_MIN_COVERAGE 0.75
+#define LEARN_MIN_CLARITY 0.30
+#define LEARN_MAGIC 0x314c3045 /* "E0L1" */
 /* frames where the finger covers less than this are touch-down/lift */
 #define MIN_FRAME_COVERAGE 0.3
 /* presses below these are asked again. Coverage applies everywhere; the
@@ -45,6 +68,11 @@
 /* background mean above this means a finger is still on the sensor */
 #define EMPTY_BG_MEAN 100
 #define LIFT_POLL_MS 100
+/* a finger already on the sensor when a capture starts is the last press
+ * still lifting if a capture ended less than this ago (so a wrong finger held
+ * down can't use up the tries at once); after longer it is a new press, e.g.
+ * one made while the lock screen was restarting its check */
+#define FRESH_PRESS_US (1500 * G_TIME_SPAN_MILLISECOND)
 #define PRINT_VERSION 1
 
 #ifdef E0C7F_LOG_SCORES
@@ -63,6 +91,8 @@ static const guint8 cmd_led_on[] = { 0x40, 0x31 };
 static const guint8 cmd_pre_scan[] = { 0x40, 0x3f };
 static const guint8 cmd_stop[] = { 0x00, 0x0b };
 
+typedef struct _MatchJob MatchJob;
+
 struct _FpiDeviceElan0c7f
 {
   FpDevice parent;
@@ -76,12 +106,21 @@ struct _FpiDeviceElan0c7f
   /* enrolled templates collected so far */
   GArray  *enroll_templates;
   guint    spot_retries;
+
+  gint64   last_capture_end; /* monotonic time */
+
+  /* early match of the current press (see EARLY_FRAMES) */
+  guint    capture_id;
+  gboolean capturing;
+  gboolean early_started;
+  GTask   *early_task; /* set once the early match accepted the press */
 };
 
 G_DECLARE_FINAL_TYPE (FpiDeviceElan0c7f, fpi_device_elan0c7f, FPI, DEVICE_ELAN0C7F, FpDevice);
 G_DEFINE_TYPE (FpiDeviceElan0c7f, fpi_device_elan0c7f, FP_TYPE_DEVICE);
 
 static void start_capture (FpDevice *dev);
+static void start_early_match (FpDevice *dev);
 
 /* ---- USB command helpers ---------------------------------------------- */
 
@@ -302,11 +341,14 @@ capture_run_state (FpiSsm *ssm, FpDevice *dev)
       break;
 
     case CAP_BG_CHECK:
-      /* untouched pixels read as zero, so a bright frame means the finger
-       * from the previous press is still there */
+      /* untouched pixels read as zero, so a bright frame means a finger is
+       * already there: the previous press still lifting, or (on an idle
+       * sensor, not during enrollment) a new one to read at once */
       for (gsize i = 0; i + 1 < self->last_read_len; i += 2)
         sum += self->last_read[i] | (self->last_read[i + 1] << 8);
-      if (sum / E0C7F_PIXELS > EMPTY_BG_MEAN)
+      if (sum / E0C7F_PIXELS > EMPTY_BG_MEAN &&
+          (fpi_device_get_current_action (dev) == FPI_DEVICE_ACTION_ENROLL ||
+           g_get_monotonic_time () - self->last_capture_end < FRESH_PRESS_US))
         {
           fpi_device_report_finger_status_changes (dev, FP_FINGER_STATUS_PRESENT,
                                                    FP_FINGER_STATUS_NONE);
@@ -362,7 +404,15 @@ capture_run_state (FpiSsm *ssm, FpDevice *dev)
         /* only count frames where the finger is properly down */
         if (covered > MIN_FRAME_COVERAGE * E0C7F_PIXELS)
           self->nframes++;
-        if (self->nframes < CAPTURE_FRAMES)
+        if (self->nframes == EARLY_FRAMES && !self->early_started &&
+            fpi_device_get_current_action (dev) != FPI_DEVICE_ACTION_ENROLL)
+          {
+            self->early_started = TRUE;
+            start_early_match (dev);
+          }
+        if (self->early_task)
+          fpi_ssm_jump_to_state (ssm, CAP_STOP);
+        else if (self->nframes < CAPTURE_FRAMES)
           fpi_ssm_jump_to_state (ssm, CAP_WAIT_FINGER);
         else
           fpi_ssm_next_state (ssm);
@@ -377,14 +427,16 @@ capture_run_state (FpiSsm *ssm, FpDevice *dev)
 
 /* ---- matching (runs in a worker thread) ------------------------------- */
 
-typedef struct
+struct _MatchJob
 {
   FpiDeviceAction action;
+  guint           capture_id;
   guint16        *frames;
   int             nframes;
   /* enrolled templates to compare against, with the print each belongs to */
   GArray         *templates;
   GPtrArray      *owners;
+  GByteArray     *learned; /* per template: 1 if learned, 0 if enrolled */
   /* results */
   E0c7fTemplate   probe;
   gboolean        probe_ok;
@@ -393,7 +445,7 @@ typedef struct
   double         *scores; /* per template, same order as templates */
   double          best_score;
   FpPrint        *best_print;
-} MatchJob;
+};
 
 static void
 match_job_free (MatchJob *job)
@@ -402,6 +454,7 @@ match_job_free (MatchJob *job)
   g_free (job->scores);
   g_clear_pointer (&job->templates, g_array_unref);
   g_clear_pointer (&job->owners, g_ptr_array_unref);
+  g_clear_pointer (&job->learned, g_byte_array_unref);
   g_free (job);
 }
 
@@ -502,10 +555,99 @@ templates_to_variant (GArray *templates)
                         g_variant_builder_end (&builder));
 }
 
-/* append the templates stored in print to templates/owners */
-static gboolean
-add_print_templates (FpPrint *print, GArray *templates, GPtrArray *owners)
+/* learned templates of print live in a file named after its data */
+static gchar *
+learned_path (FpPrint *print)
 {
+  g_autoptr(GVariant) data = NULL;
+  g_autofree gchar *sum = NULL;
+  const gchar *dir = g_getenv ("E0C7F_LEARN_DIR");
+
+  g_object_get (print, "fpi-data", &data, NULL);
+  if (!data)
+    return NULL;
+  sum = g_compute_checksum_for_data (G_CHECKSUM_SHA256, g_variant_get_data (data),
+                                     g_variant_get_size (data));
+  return g_strdup_printf ("%s/%s.bin", dir ? dir : LEARN_DIR, sum);
+}
+
+typedef struct
+{
+  guint32 magic, count, next;
+} LearnedHeader;
+
+/* the learned templates of print (none if there is no valid file) */
+static GArray *
+load_learned (FpPrint *print, guint *next)
+{
+  g_autofree gchar *path = learned_path (print);
+  g_autofree gchar *contents = NULL;
+  GArray *out = g_array_new (FALSE, FALSE, sizeof (E0c7fTemplate));
+  LearnedHeader h;
+  gsize len;
+
+  *next = 0;
+  if (!path || !g_file_get_contents (path, &contents, &len, NULL) || len < sizeof h)
+    return out;
+  memcpy (&h, contents, sizeof h);
+  if (h.magic != LEARN_MAGIC || h.count > LEARN_SLOTS ||
+      len != sizeof h + h.count * sizeof (E0c7fTemplate))
+    return out;
+  g_array_append_vals (out, contents + sizeof h, h.count);
+  *next = h.next % LEARN_SLOTS;
+  return out;
+}
+
+/* add probe to the learned templates of print, replacing the oldest */
+static guint
+store_learned (FpPrint *print, const E0c7fTemplate *probe)
+{
+  g_autofree gchar *path = learned_path (print);
+  g_autoptr(GArray) learned = NULL;
+  g_autoptr(GByteArray) out = g_byte_array_new ();
+  g_autoptr(GError) error = NULL;
+  g_autofree gchar *dir = NULL;
+  LearnedHeader h;
+  guint next, slot;
+
+  if (!path)
+    return G_MAXUINT;
+  learned = load_learned (print, &next);
+  if (learned->len < LEARN_SLOTS)
+    {
+      slot = learned->len;
+      g_array_append_vals (learned, probe, 1);
+    }
+  else
+    {
+      slot = next;
+      g_array_index (learned, E0c7fTemplate, slot) = *probe;
+    }
+
+  h = (LearnedHeader) { LEARN_MAGIC, learned->len, (slot + 1) % LEARN_SLOTS };
+  g_byte_array_append (out, (const guint8 *) &h, sizeof h);
+  g_byte_array_append (out, (const guint8 *) learned->data, learned->len * sizeof (E0c7fTemplate));
+
+  dir = g_path_get_dirname (path);
+  if (g_mkdir_with_parents (dir, 0700) < 0 ||
+      !g_file_set_contents_full (path, (const gchar *) out->data, out->len,
+                                 G_FILE_SET_CONTENTS_CONSISTENT, 0600, &error))
+    {
+      g_warning ("elan0c7f: could not save a learned template: %s",
+                 error ? error->message : g_strerror (errno));
+      return G_MAXUINT;
+    }
+  return slot;
+}
+
+/* append the templates stored in print, then its learned ones, to
+ * templates/owners/learned */
+static gboolean
+add_print_templates (FpPrint *print, GArray *templates, GPtrArray *owners, GByteArray *learned)
+{
+  g_autoptr(GArray) extra = NULL;
+  const guint8 yes = 1, no = 0;
+  guint next;
   g_autoptr(GVariant) data = NULL;
   g_autoptr(GVariant) list = NULL;
   guint16 version, w, h;
@@ -533,9 +675,18 @@ add_print_templates (FpPrint *print, GArray *templates, GPtrArray *owners)
           memcpy (t.mask, mp, E0C7F_PIXELS);
           g_array_append_val (templates, t);
           g_ptr_array_add (owners, print);
+          g_byte_array_append (learned, &no, 1);
         }
       g_variant_unref (img);
       g_variant_unref (mask);
+    }
+
+  extra = load_learned (print, &next);
+  for (guint i = 0; i < extra->len; i++)
+    {
+      g_array_append_val (templates, g_array_index (extra, E0c7fTemplate, i));
+      g_ptr_array_add (owners, print);
+      g_byte_array_append (learned, &yes, 1);
     }
   return TRUE;
 }
@@ -571,12 +722,47 @@ describe_scores (MatchJob *job)
   return g_string_free (g_steal_pointer (&out), FALSE);
 }
 
+/* after a match: learn the press if it is clearly this finger (see
+ * LEARN_DIR for the safeguards) */
 static void
-match_done (GObject *source, GAsyncResult *res, gpointer user_data)
+maybe_learn (MatchJob *job)
 {
-  FpDevice *dev = FP_DEVICE (source);
+  g_autoptr(GEnumClass) fingers = NULL;
+  double enrolled = -1, same = -1, other = -1;
+  GEnumValue *name;
+  guint slot;
+
+  if (job->action == FPI_DEVICE_ACTION_ENROLL || !job->probe_ok || !job->scores ||
+      !job->best_print || job->best_score < E0C7F_MATCH_THRESHOLD)
+    return;
+  for (guint i = 0; i < job->templates->len; i++)
+    {
+      if (g_ptr_array_index (job->owners, i) != job->best_print)
+        other = MAX (other, job->scores[i]);
+      else if (job->learned->data[i])
+        same = MAX (same, job->scores[i]);
+      else
+        enrolled = MAX (enrolled, job->scores[i]);
+    }
+  same = MAX (same, enrolled);
+  if (enrolled < LEARN_MIN_SCORE || same > LEARN_MAX_SCORE ||
+      enrolled - other < LEARN_MIN_MARGIN ||
+      job->coverage < LEARN_MIN_COVERAGE || job->clarity < LEARN_MIN_CLARITY)
+    return;
+
+  slot = store_learned (job->best_print, &job->probe);
+  if (slot == G_MAXUINT)
+    return;
+  fingers = g_type_class_ref (FP_TYPE_FINGER);
+  name = g_enum_get_value (fingers, fp_print_get_finger (job->best_print));
+  E0C7F_SCORE_LOG ("elan0c7f: learned this press for %s (slot %u of %u)",
+                   name ? name->value_nick : "unknown", slot + 1, LEARN_SLOTS);
+}
+
+static void
+report_match (FpDevice *dev, MatchJob *job)
+{
   FpiDeviceElan0c7f *self = FPI_DEVICE_ELAN0C7F (dev);
-  MatchJob *job = g_task_get_task_data (G_TASK (res));
   g_autofree gchar *scores = describe_scores (job);
   GError *retry = NULL;
   FpPrint *print;
@@ -629,6 +815,8 @@ match_done (GObject *source, GAsyncResult *res, gpointer user_data)
       break;
 
     case FPI_DEVICE_ACTION_VERIFY:
+      /* before reporting: the prints are freed once the action completes */
+      maybe_learn (job);
       if (retry)
         fpi_device_verify_report (dev, FPI_MATCH_ERROR, NULL, retry);
       else
@@ -640,6 +828,8 @@ match_done (GObject *source, GAsyncResult *res, gpointer user_data)
       break;
 
     case FPI_DEVICE_ACTION_IDENTIFY:
+      /* before reporting: the prints are freed once the action completes */
+      maybe_learn (job);
       if (retry)
         fpi_device_identify_report (dev, NULL, NULL, retry);
       else
@@ -656,13 +846,97 @@ match_done (GObject *source, GAsyncResult *res, gpointer user_data)
 }
 
 static void
+match_done (GObject *source, GAsyncResult *res, gpointer user_data)
+{
+  report_match (FP_DEVICE (source), g_task_get_task_data (G_TASK (res)));
+}
+
+/* a match job for frames (taken over) against the prints of the current
+ * action; NULL with error if the prints can't be read */
+static MatchJob *
+match_job_new (FpDevice *dev, guint16 *frames, int nframes, GError **error)
+{
+  FpiDeviceAction action = fpi_device_get_current_action (dev);
+  MatchJob *job = g_new0 (MatchJob, 1);
+
+  job->action = action;
+  job->capture_id = FPI_DEVICE_ELAN0C7F (dev)->capture_id;
+  job->frames = frames;
+  job->nframes = nframes;
+  job->templates = g_array_new (FALSE, FALSE, sizeof (E0c7fTemplate));
+  job->owners = g_ptr_array_new ();
+  job->learned = g_byte_array_new ();
+
+  if (action == FPI_DEVICE_ACTION_VERIFY)
+    {
+      FpPrint *print;
+
+      fpi_device_get_verify_data (dev, &print);
+      if (!add_print_templates (print, job->templates, job->owners, job->learned))
+        {
+          match_job_free (job);
+          g_set_error_literal (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_DATA_INVALID,
+                               "The stored print is not from this driver");
+          return NULL;
+        }
+    }
+  else if (action == FPI_DEVICE_ACTION_IDENTIFY)
+    {
+      GPtrArray *prints;
+
+      fpi_device_get_identify_data (dev, &prints);
+      for (guint i = 0; i < prints->len; i++)
+        add_print_templates (g_ptr_array_index (prints, i), job->templates, job->owners,
+                             job->learned);
+    }
+  return job;
+}
+
+static void
+run_match (FpDevice *dev, MatchJob *job, GAsyncReadyCallback done)
+{
+  g_autoptr(GTask) task = g_task_new (dev, NULL, done, NULL);
+
+  g_task_set_task_data (task, job, (GDestroyNotify) match_job_free);
+  g_task_run_in_thread (task, match_thread);
+}
+
+static void
+early_match_done (GObject *source, GAsyncResult *res, gpointer user_data)
+{
+  FpiDeviceElan0c7f *self = FPI_DEVICE_ELAN0C7F (source);
+  MatchJob *job = g_task_get_task_data (G_TASK (res));
+
+  E0C7F_SCORE_LOG ("elan0c7f: early check: %d frames, probe %s, best %.3f (accept at %.3f)",
+                   job->nframes, job->probe_ok ? "ok" : "rejected", job->best_score, EARLY_ACCEPT);
+  /* keep it only if the press it belongs to is still being captured; the
+   * capture then stops at its next frame and reports this result */
+  if (self->capturing && job->capture_id == self->capture_id &&
+      job->probe_ok && job->best_score >= EARLY_ACCEPT)
+    self->early_task = g_object_ref (G_TASK (res));
+}
+
+static void
+start_early_match (FpDevice *dev)
+{
+  FpiDeviceElan0c7f *self = FPI_DEVICE_ELAN0C7F (dev);
+  MatchJob *job;
+
+  job = match_job_new (dev, g_memdup2 (self->frames, EARLY_FRAMES * E0C7F_PIXELS * sizeof (guint16)),
+                       EARLY_FRAMES, NULL);
+  if (job)
+    run_match (dev, job, early_match_done);
+}
+
+static void
 capture_done (FpiSsm *ssm, FpDevice *dev, GError *error)
 {
   FpiDeviceElan0c7f *self = FPI_DEVICE_ELAN0C7F (dev);
-  FpiDeviceAction action = fpi_device_get_current_action (dev);
-  g_autoptr(GTask) task = NULL;
+  g_autoptr(GTask) early = g_steal_pointer (&self->early_task);
   MatchJob *job;
 
+  self->capturing = FALSE;
+  self->last_capture_end = g_get_monotonic_time ();
   fpi_device_report_finger_status_changes (dev, FP_FINGER_STATUS_NONE,
                                            FP_FINGER_STATUS_PRESENT | FP_FINGER_STATUS_NEEDED);
   if (error)
@@ -672,37 +946,19 @@ capture_done (FpiSsm *ssm, FpDevice *dev, GError *error)
       return;
     }
 
-  job = g_new0 (MatchJob, 1);
-  job->action = action;
-  job->frames = g_steal_pointer (&self->frames);
-  job->nframes = self->nframes;
-  job->templates = g_array_new (FALSE, FALSE, sizeof (E0c7fTemplate));
-  job->owners = g_ptr_array_new ();
-
-  if (action == FPI_DEVICE_ACTION_VERIFY)
+  if (early)
     {
-      FpPrint *print;
-
-      fpi_device_get_verify_data (dev, &print);
-      if (!add_print_templates (print, job->templates, job->owners))
-        {
-          match_job_free (job);
-          fpi_device_action_error (dev, fpi_device_error_new (FP_DEVICE_ERROR_DATA_INVALID));
-          return;
-        }
-    }
-  else if (action == FPI_DEVICE_ACTION_IDENTIFY)
-    {
-      GPtrArray *prints;
-
-      fpi_device_get_identify_data (dev, &prints);
-      for (guint i = 0; i < prints->len; i++)
-        add_print_templates (g_ptr_array_index (prints, i), job->templates, job->owners);
+      report_match (dev, g_task_get_task_data (early));
+      return;
     }
 
-  task = g_task_new (dev, NULL, match_done, NULL);
-  g_task_set_task_data (task, job, (GDestroyNotify) match_job_free);
-  g_task_run_in_thread (task, match_thread);
+  job = match_job_new (dev, g_steal_pointer (&self->frames), self->nframes, &error);
+  if (!job)
+    {
+      fpi_device_action_error (dev, error);
+      return;
+    }
+  run_match (dev, job, match_done);
 }
 
 static void
@@ -713,6 +969,10 @@ start_capture (FpDevice *dev)
   g_free (self->frames);
   self->frames = g_new0 (guint16, CAPTURE_FRAMES * E0C7F_PIXELS);
   self->nframes = 0;
+  self->capture_id++;
+  self->capturing = TRUE;
+  self->early_started = FALSE;
+  g_clear_object (&self->early_task);
   fpi_ssm_start (fpi_ssm_new (dev, capture_run_state, CAP_NUM_STATES), capture_done);
 }
 

@@ -1,0 +1,3 @@
+# Keep the ELAN 04f3:0c7f fingerprint sensor powered, so the first touch is
+# read at once instead of after a USB wake-up.
+ACTION=="add|change", SUBSYSTEM=="usb", ATTR{idVendor}=="04f3", ATTR{idProduct}=="0c7f", TEST=="power/control", ATTR{power/control}="on"

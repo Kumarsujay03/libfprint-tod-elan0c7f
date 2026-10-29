@@ -25,6 +25,9 @@ jobs:
       - name: Check the plugin installs
         run: make install DESTDIR="$PWD/stage" && find stage -name '*.so'
 
+      - name: Run the learning unit test
+        run: make check
+
       - name: Build the score-logging variant and tools
         run: |
           make clean
