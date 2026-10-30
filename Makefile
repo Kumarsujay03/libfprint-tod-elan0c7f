@@ -8,10 +8,12 @@
 # Options:
 #   LOG_SCORES=1   log every match score to the system log (for measuring
 #                  accuracy; leave off for normal use)
+#   SAVE_SAMPLES=1 keep the raw frames of every enrollment press and a
+#                  picture of the mosaic in /var/lib/fprint/.elan0c7f-samples
+#                  (root only), for trying better image processing later
 #   TOD_ROOT=dir   use unpacked -dev packages under dir instead of installed ones
 
 PLUGIN  := libfprint-tod-elan0c7f.so
-UDEVDIR ?= /etc/udev/rules.d
 PKGS    := glib-2.0 gobject-2.0 gio-2.0 gmodule-2.0 gusb
 
 ifdef TOD_ROOT
@@ -31,12 +33,20 @@ CFLAGS  += -fPIC -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initiali
 ifeq ($(LOG_SCORES),1)
   CFLAGS += -DE0C7F_LOG_SCORES
 endif
+ifeq ($(SAVE_SAMPLES),1)
+  CFLAGS += -DE0C7F_SAVE_SAMPLES
+endif
 LDLIBS  := $(FP_LIBS) $(shell pkg-config --libs $(PKGS)) -lm
 
 all: $(PLUGIN)
 
 $(PLUGIN): elan0c7f.c matcher.c matcher.h
 	$(CC) $(CFLAGS) -shared -Wl,--no-undefined -o $@ elan0c7f.c matcher.c $(LDLIBS)
+
+# offline mosaic check on recorded raw frame dumps: stitches enrollment
+# presses and scores right- and wrong-finger presses against the mosaic
+mosaic-test: tools/mosaic-test.c matcher.c matcher.h
+	$(CC) -O2 -Wall -Wextra -Wno-missing-field-initializers -I. -o $@ tools/mosaic-test.c matcher.c -lm
 
 # offline matcher check on recorded raw frames (see tools/)
 match-test: tools/match-test.c matcher.c matcher.h
@@ -56,13 +66,12 @@ check: tools/learn-test.c elan0c7f.c matcher.c matcher.h
 install: $(PLUGIN)
 	@test -n "$(TODDIR)" || { echo "libfprint TOD driver directory not found"; exit 1; }
 	install -D -m 644 $(PLUGIN) $(DESTDIR)$(TODDIR)/$(PLUGIN)
-	install -D -m 644 udev/60-elan0c7f-awake.rules $(DESTDIR)$(UDEVDIR)/60-elan0c7f-awake.rules
-	@echo "Installed. Now run: sudo udevadm trigger && sudo systemctl restart fprintd"
+	@echo "Installed. Restart fprintd: sudo systemctl restart fprintd"
 
 uninstall:
-	rm -f $(DESTDIR)$(TODDIR)/$(PLUGIN) $(DESTDIR)$(UDEVDIR)/60-elan0c7f-awake.rules
+	rm -f $(DESTDIR)$(TODDIR)/$(PLUGIN)
 
 clean:
-	rm -f $(PLUGIN) match-test list-devices
+	rm -f $(PLUGIN) match-test mosaic-test list-devices
 
 .PHONY: all check install uninstall clean

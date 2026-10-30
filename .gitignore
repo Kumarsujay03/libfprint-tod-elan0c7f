@@ -11,3 +11,4 @@
 *.log
 samples/
 captures/
+/mosaic-test

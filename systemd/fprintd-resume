@@ -1,0 +1,11 @@
+#!/bin/sh
+# systemd system-sleep hook: restart fprintd after a suspend.
+# If the lid closes while a fingerprint check is reading the sensor, fprintd
+# aborts it ("Cannot run while suspended") but can't release the device
+# ("still busy"), and fprintd here runs without its idle timeout, so the
+# sensor would stay claimed and every lock screen check would fail until
+# fprintd restarts. Restarting it after every resume clears that.
+case $1/$2 in
+    post/*) systemctl --no-block restart fprintd.service ;;
+esac
+exit 0

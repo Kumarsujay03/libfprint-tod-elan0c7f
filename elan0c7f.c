@@ -6,8 +6,6 @@
  * Its images are too small for minutiae matching, so this driver stores the
  * cleaned ridge images and matches them itself (see matcher.c).
  *
- * Copyright (C) 2026 Kumarsujay03
- *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
  * License as published by the Free Software Foundation; either
@@ -50,6 +48,17 @@
 #define LEARN_DIR "/var/lib/fprint/.elan0c7f-learned"
 #define LEARN_SLOTS 5
 #define LEARN_MIN_SCORE 0.65  /* against an enrolled template */
+/* against an enrolled mosaic: right fingers there mostly score 0.57-0.75
+ * and wrong ones stayed at or below 0.50, so a lower bar lets weaker
+ * fingers learn too (the margin over other fingers still applies) */
+#define LEARN_MIN_MOSAIC_SCORE 0.60
+/* Mosaic prints also keep a library of their good presses (root only, next
+ * to the learned mosaic), so presses that did not fit when they came can
+ * be fitted in later: whenever learning grows the mosaic, the presses
+ * still waiting (including enrolled ones that never stitched) are tried
+ * again. The oldest press makes room when it is full. */
+#define LIBRARY_SLOTS 100
+#define LIBRARY_MAGIC 0x31503045 /* "E0P1" */
 #define LEARN_MAX_SCORE 0.90  /* already this close to a template: nothing new */
 #define LEARN_MIN_MARGIN 0.20 /* over the best other finger */
 #define LEARN_MIN_COVERAGE 0.75
@@ -64,7 +73,23 @@
 #define MIN_ENROLL_CLARITY 0.22
 /* after this many retries of one spot the next press is accepted anyway */
 #define MAX_SPOT_RETRIES 2
-#define NR_ENROLL_STAGES 15
+/* Enrollment keeps taking presses until the whole finger is known. Each
+ * press is stitched into the finger's mosaic (see matcher.h); once
+ * ENROLL_REPEATS presses in a row add almost no new area, the finger is
+ * covered and enrollment ends. ENROLL_MAX_PRESSES is the most it asks for. */
+#define ENROLL_MIN_PRESSES 10
+#define ENROLL_MAX_PRESSES 30
+#define ENROLL_REPEATS 4
+#define ENROLL_REPEAT_AREA 0.10 /* of a press: a press adding less is a repeat */
+#define ENROLL_MIN_AREA 3.0     /* presses' worth of finger before it may end */
+/* nor while more presses than this wait to be stitched: a later press may
+ * bridge to them and add a whole new part (one may be a slipped finger) */
+#define ENROLL_MAX_ASIDE 1
+/* a press that does not overlap the finger captured so far is asked for
+ * again, closer in (so the mosaic stays one piece); after this many misses
+ * in a row it is kept aside instead, so enrollment can't get stuck */
+#define ENROLL_MAX_MISSES 3
+#define NR_ENROLL_STAGES ENROLL_MAX_PRESSES
 /* background mean above this means a finger is still on the sensor */
 #define EMPTY_BG_MEAN 100
 #define LIFT_POLL_MS 100
@@ -73,7 +98,17 @@
  * down can't use up the tries at once); after longer it is a new press, e.g.
  * one made while the lock screen was restarting its check */
 #define FRESH_PRESS_US (1500 * G_TIME_SPAN_MILLISECOND)
-#define PRINT_VERSION 1
+/* prints are saved as their presses (version 1), or since mosaics as the
+ * presses, which of them are stitched, and the mosaic (version 2) */
+#define PRINT_VERSION_PRESSES 1
+#define PRINT_VERSION_MOSAIC 2
+/* the mosaic as learning has updated it, next to the learned templates */
+#define MOSAIC_MAGIC 0x314d3045 /* "E0M1" */
+#define MOSAIC_MAX_SIDE 1024
+/* builds with -DE0C7F_SAVE_SAMPLES keep the raw frames of every enrollment
+ * press and a picture of the mosaic here (root only), so better image
+ * processing can be tried later without enrolling again */
+#define SAMPLES_DIR "/var/lib/fprint/.elan0c7f-samples"
 
 #ifdef E0C7F_LOG_SCORES
 #define E0C7F_SCORE_LOG g_message
@@ -103,9 +138,15 @@ struct _FpiDeviceElan0c7f
   guint16 *frames;
   int      nframes;
 
-  /* enrolled templates collected so far */
-  GArray  *enroll_templates;
-  guint    spot_retries;
+  /* enrollment so far: the presses, which are stitched into the mosaic,
+   * and how many presses in a row added nothing new */
+  GArray      *enroll_templates;
+  GByteArray  *enroll_stitched;
+  E0c7fMosaic *enroll_mosaic;
+  guint        enroll_repeats;
+  guint        enroll_misses;
+  guint        spot_retries;
+  gchar       *samples_dir;
 
   gint64   last_capture_end; /* monotonic time */
 
@@ -121,6 +162,15 @@ G_DEFINE_TYPE (FpiDeviceElan0c7f, fpi_device_elan0c7f, FP_TYPE_DEVICE);
 
 static void start_capture (FpDevice *dev);
 static void start_early_match (FpDevice *dev);
+
+static void
+enroll_state_clear (FpiDeviceElan0c7f *self)
+{
+  g_clear_pointer (&self->enroll_templates, g_array_unref);
+  g_clear_pointer (&self->enroll_stitched, g_byte_array_unref);
+  g_clear_pointer (&self->enroll_mosaic, e0c7f_mosaic_free);
+  g_clear_pointer (&self->samples_dir, g_free);
+}
 
 /* ---- USB command helpers ---------------------------------------------- */
 
@@ -269,7 +319,7 @@ dev_close (FpDevice *dev)
 
   g_clear_pointer (&self->last_read, g_free);
   g_clear_pointer (&self->frames, g_free);
-  g_clear_pointer (&self->enroll_templates, g_array_unref);
+  enroll_state_clear (self);
   g_usb_device_release_interface (fpi_device_get_usb_device (dev), 0, 0, &error);
   fpi_device_close_complete (dev, error);
 }
@@ -437,12 +487,30 @@ struct _MatchJob
   GArray         *templates;
   GPtrArray      *owners;
   GByteArray     *learned; /* per template: 1 if learned, 0 if enrolled */
+  /* the same for mosaics: per print the enrolled one, and the learned one
+   * if learning has updated it */
+  GPtrArray      *mosaics;
+  GPtrArray      *mosaic_owners;
+  GByteArray     *mosaic_learned;
+  gint            next_ref; /* work queue over mosaics, then templates */
+  guint           spot_retries;
+  /* enrollment state, lent by the device while the thread stitches */
+  GArray         *enroll_templates;
+  GByteArray     *enroll_stitched;
+  E0c7fMosaic    *enroll_mosaic;
+  guint           enroll_misses;
+  int             enroll_added;    /* pixels the press added */
+  gboolean        enroll_fits;     /* the press is stitched on */
+  gboolean        enroll_too_far;  /* not taken: it overlaps nothing known */
+  double          enroll_fit;      /* how well it fits the mosaic */
   /* results */
   E0c7fTemplate   probe;
   gboolean        probe_ok;
   double          coverage, clarity;
   FpDeviceRetry   retry_reason; /* why probe_ok is FALSE */
   double         *scores; /* per template, same order as templates */
+  double         *mosaic_scores;
+  E0c7fPlace     *mosaic_places;
   double          best_score;
   FpPrint        *best_print;
 };
@@ -452,38 +520,102 @@ match_job_free (MatchJob *job)
 {
   g_free (job->frames);
   g_free (job->scores);
+  g_free (job->mosaic_scores);
+  g_free (job->mosaic_places);
   g_clear_pointer (&job->templates, g_array_unref);
   g_clear_pointer (&job->owners, g_ptr_array_unref);
   g_clear_pointer (&job->learned, g_byte_array_unref);
+  g_clear_pointer (&job->mosaics, g_ptr_array_unref);
+  g_clear_pointer (&job->mosaic_owners, g_ptr_array_unref);
+  g_clear_pointer (&job->mosaic_learned, g_byte_array_unref);
+  g_clear_pointer (&job->enroll_templates, g_array_unref);
+  g_clear_pointer (&job->enroll_stitched, g_byte_array_unref);
+  g_clear_pointer (&job->enroll_mosaic, e0c7f_mosaic_free);
   g_free (job);
 }
 
-typedef struct
-{
-  MatchJob *job;
-  guint     first, step;
-  double    best;
-  guint     best_idx;
-} MatchSlice;
-
+/* takes mosaics and templates off the job's queue until none are left */
 static gpointer
-match_slice (gpointer data)
+match_worker (gpointer data)
 {
-  MatchSlice *s = data;
+  MatchJob *job = data;
+  guint nm = job->mosaics->len, total = nm + job->templates->len, i;
 
-  s->best = -1;
-  for (guint i = s->first; i < s->job->templates->len; i += s->step)
+  /* mosaics first: they take longest */
+  while ((i = g_atomic_int_add (&job->next_ref, 1)) < total)
+    if (i < nm)
+      job->mosaic_scores[i] = e0c7f_mosaic_match (g_ptr_array_index (job->mosaics, i),
+                                                  &job->probe, E0C7F_MATCH_OVERLAP,
+                                                  &job->mosaic_places[i]);
+    else
+      job->scores[i - nm] = e0c7f_match (&g_array_index (job->templates, E0c7fTemplate, i - nm),
+                                         &job->probe);
+  return NULL;
+}
+
+/* why an enrollment press must be repeated, or -1 to take it */
+static int
+enroll_retry (MatchJob *job)
+{
+  if (!job->probe_ok)
+    return job->retry_reason;
+  /* ask for the same spot again if the press was half-on or unclear,
+   * but only a couple of times so enrollment can't get stuck */
+  if (job->spot_retries < MAX_SPOT_RETRIES)
     {
-      double score = e0c7f_match (&g_array_index (s->job->templates, E0c7fTemplate, i),
-                                  &s->job->probe);
-      s->job->scores[i] = score;
-      if (score > s->best)
+      if (job->coverage < MIN_PRESS_COVERAGE)
+        return FP_DEVICE_RETRY_CENTER_FINGER;
+      if (job->clarity < MIN_ENROLL_CLARITY)
+        return FP_DEVICE_RETRY_GENERAL;
+    }
+  return -1;
+}
+
+/* add an enrollment press: stitch it onto the mosaic, then retry the
+ * presses kept aside, since the mosaic may have grown towards them */
+static void
+stitch_press (MatchJob *job)
+{
+  const guint8 no = 0;
+  guint8 *stitched;
+  E0c7fPlace at;
+  guint n;
+
+  if (job->enroll_mosaic)
+    {
+      job->enroll_fit = e0c7f_mosaic_match (job->enroll_mosaic, &job->probe,
+                                            E0C7F_STITCH_OVERLAP, &at);
+      if (job->enroll_fit < E0C7F_STITCH_MIN && job->enroll_misses < ENROLL_MAX_MISSES)
         {
-          s->best = score;
-          s->best_idx = i;
+          job->enroll_too_far = TRUE;
+          return;
         }
     }
-  return NULL;
+  g_array_append_val (job->enroll_templates, job->probe);
+  g_byte_array_append (job->enroll_stitched, &no, 1);
+  n = job->enroll_templates->len;
+  stitched = job->enroll_stitched->data;
+  if (!job->enroll_mosaic)
+    {
+      job->enroll_mosaic = e0c7f_mosaic_new (&job->probe);
+      job->enroll_added = e0c7f_mosaic_area (job->enroll_mosaic);
+      stitched[n - 1] = 1;
+    }
+  for (gboolean grew = TRUE; grew;)
+    {
+      grew = FALSE;
+      for (guint i = 0; i < n; i++)
+        {
+          const E0c7fTemplate *t = &g_array_index (job->enroll_templates, E0c7fTemplate, i);
+          if (stitched[i] ||
+              e0c7f_mosaic_match (job->enroll_mosaic, t, E0C7F_STITCH_OVERLAP, &at) < E0C7F_STITCH_MIN)
+            continue;
+          job->enroll_added += e0c7f_mosaic_add (job->enroll_mosaic, t, &at);
+          stitched[i] = 1;
+          grew = TRUE;
+        }
+    }
+  job->enroll_fits = stitched[n - 1];
 }
 
 static void
@@ -491,8 +623,7 @@ match_thread (GTask *task, gpointer source, gpointer task_data,
               GCancellable *cancellable)
 {
   MatchJob *job = task_data;
-  guint nthreads;
-  g_autofree MatchSlice *slices = NULL;
+  guint nthreads, total;
   g_autofree GThread **threads = NULL;
 
   job->probe_ok = e0c7f_template_from_frames (job->frames, job->nframes, &job->probe) == 0;
@@ -501,43 +632,56 @@ match_thread (GTask *task, gpointer source, gpointer task_data,
     {
       e0c7f_template_quality (&job->probe, &job->coverage, &job->clarity);
       /* a half-on press can't be judged; ask again instead of failing.
-       * Enrollment applies its own, capped checks in match_done() */
+       * Enrollment applies its own, capped checks in enroll_retry() */
       if (job->action != FPI_DEVICE_ACTION_ENROLL && job->coverage < MIN_PRESS_COVERAGE)
         job->probe_ok = FALSE;
     }
   job->best_score = -1;
-  if (!job->probe_ok || !job->templates || job->templates->len == 0)
+  if (job->action == FPI_DEVICE_ACTION_ENROLL)
+    {
+      if (enroll_retry (job) < 0)
+        stitch_press (job);
+      g_task_return_boolean (task, TRUE);
+      return;
+    }
+  total = job->templates->len + job->mosaics->len;
+  if (!job->probe_ok || total == 0)
     {
       g_task_return_boolean (task, TRUE);
       return;
     }
 
-  /* each comparison takes ~25 ms, so spread them over the CPUs */
+  /* a template takes ~25 ms and a mosaic ~150 ms, so spread them over
+   * the CPUs */
   job->scores = g_new0 (double, job->templates->len);
-  nthreads = MIN (g_get_num_processors (), job->templates->len);
-  slices = g_new0 (MatchSlice, nthreads);
+  job->mosaic_scores = g_new0 (double, job->mosaics->len);
+  job->mosaic_places = g_new0 (E0c7fPlace, job->mosaics->len);
+  nthreads = MIN (g_get_num_processors (), total);
   threads = g_new0 (GThread *, nthreads);
   for (guint t = 0; t < nthreads; t++)
-    {
-      slices[t] = (MatchSlice) { .job = job, .first = t, .step = nthreads };
-      threads[t] = g_thread_new ("elan0c7f-match", match_slice, &slices[t]);
-    }
+    threads[t] = g_thread_new ("elan0c7f-match", match_worker, job);
   for (guint t = 0; t < nthreads; t++)
-    {
-      g_thread_join (threads[t]);
-      if (slices[t].best > job->best_score)
-        {
-          job->best_score = slices[t].best;
-          job->best_print = g_ptr_array_index (job->owners, slices[t].best_idx);
-        }
-    }
+    g_thread_join (threads[t]);
+
+  for (guint i = 0; i < job->templates->len; i++)
+    if (job->scores[i] > job->best_score)
+      {
+        job->best_score = job->scores[i];
+        job->best_print = g_ptr_array_index (job->owners, i);
+      }
+  for (guint i = 0; i < job->mosaics->len; i++)
+    if (job->mosaic_scores[i] > job->best_score)
+      {
+        job->best_score = job->mosaic_scores[i];
+        job->best_print = g_ptr_array_index (job->mosaic_owners, i);
+      }
   g_task_return_boolean (task, TRUE);
 }
 
 /* ---- print storage ---------------------------------------------------- */
 
 static GVariant *
-templates_to_variant (GArray *templates)
+template_list_variant (GArray *templates)
 {
   GVariantBuilder builder;
 
@@ -551,13 +695,57 @@ templates_to_variant (GArray *templates)
                              g_variant_new_fixed_array (G_VARIANT_TYPE_BYTE, t->mask,
                                                         E0C7F_PIXELS, 1));
     }
-  return g_variant_new ("(qqq@a(ayay))", PRINT_VERSION, E0C7F_W, E0C7F_H,
-                        g_variant_builder_end (&builder));
+  return g_variant_builder_end (&builder);
+}
+
+/* a print stored as its presses only (before mosaics); the tests still
+ * make these */
+G_GNUC_UNUSED static GVariant *
+templates_to_variant (GArray *templates)
+{
+  return g_variant_new ("(qqq@a(ayay))", PRINT_VERSION_PRESSES, E0C7F_W, E0C7F_H,
+                        template_list_variant (templates));
+}
+
+static GVariant *
+mosaic_to_variant (const E0c7fMosaic *m)
+{
+  return g_variant_new ("(qq@ay@ay)", m->w, m->h,
+                        g_variant_new_fixed_array (G_VARIANT_TYPE_BYTE, m->img, m->w * m->h, 1),
+                        g_variant_new_fixed_array (G_VARIANT_TYPE_BYTE, m->weight, m->w * m->h, 1));
+}
+
+/* a print stored as its presses, which of them are stitched, and the mosaic */
+static GVariant *
+mosaic_print_to_variant (GArray *templates, GByteArray *stitched, const E0c7fMosaic *m)
+{
+  return g_variant_new ("(qqq@a(ayay)@ay@(qqayay))", PRINT_VERSION_MOSAIC, E0C7F_W, E0C7F_H,
+                        template_list_variant (templates),
+                        g_variant_new_fixed_array (G_VARIANT_TYPE_BYTE, stitched->data,
+                                                   stitched->len, 1),
+                        mosaic_to_variant (m));
+}
+
+static E0c7fMosaic *
+mosaic_from_variant (GVariant *v)
+{
+  g_autoptr(GVariant) img = NULL, weight = NULL;
+  guint16 w, h;
+  gsize ilen, wlen;
+  const guint8 *ip, *wp;
+
+  g_variant_get (v, "(qq@ay@ay)", &w, &h, &img, &weight);
+  ip = g_variant_get_fixed_array (img, &ilen, 1);
+  wp = g_variant_get_fixed_array (weight, &wlen, 1);
+  if (!w || !h || w > MOSAIC_MAX_SIDE || h > MOSAIC_MAX_SIDE ||
+      ilen != (gsize) w * h || wlen != (gsize) w * h)
+    return NULL;
+  return e0c7f_mosaic_wrap (w, h, g_memdup2 (ip, ilen), g_memdup2 (wp, wlen));
 }
 
 /* learned templates of print live in a file named after its data */
 static gchar *
-learned_path (FpPrint *print)
+learned_file (FpPrint *print, const char *ext)
 {
   g_autoptr(GVariant) data = NULL;
   g_autofree gchar *sum = NULL;
@@ -568,7 +756,174 @@ learned_path (FpPrint *print)
     return NULL;
   sum = g_compute_checksum_for_data (G_CHECKSUM_SHA256, g_variant_get_data (data),
                                      g_variant_get_size (data));
-  return g_strdup_printf ("%s/%s.bin", dir ? dir : LEARN_DIR, sum);
+  return g_strdup_printf ("%s/%s.%s", dir ? dir : LEARN_DIR, sum, ext);
+}
+
+static gchar *
+learned_path (FpPrint *print)
+{
+  return learned_file (print, "bin");
+}
+
+typedef struct
+{
+  guint32 magic, w, h, learned;
+} MosaicHeader;
+
+/* a learned mosaic file, or NULL if there is none or it is damaged */
+static E0c7fMosaic *
+load_mosaic_file (const gchar *path, guint *learned)
+{
+  g_autofree gchar *contents = NULL;
+  MosaicHeader h;
+  gsize len, n;
+
+  if (!path || !g_file_get_contents (path, &contents, &len, NULL) || len < sizeof h)
+    return NULL;
+  memcpy (&h, contents, sizeof h);
+  n = (gsize) h.w * h.h;
+  if (h.magic != MOSAIC_MAGIC || !h.w || !h.h || h.w > MOSAIC_MAX_SIDE ||
+      h.h > MOSAIC_MAX_SIDE || len != sizeof h + 2 * n)
+    return NULL;
+  if (learned)
+    *learned = h.learned;
+  return e0c7f_mosaic_wrap (h.w, h.h, g_memdup2 (contents + sizeof h, n),
+                            g_memdup2 (contents + sizeof h + n, n));
+}
+
+/* write a private file atomically, creating its directory */
+static gboolean
+store_private (const gchar *path, GByteArray *data, const char *what)
+{
+  g_autofree gchar *dir = g_path_get_dirname (path);
+  g_autoptr(GError) error = NULL;
+
+  if (g_mkdir_with_parents (dir, 0700) < 0 ||
+      !g_file_set_contents_full (path, (const gchar *) data->data, data->len,
+                                 G_FILE_SET_CONTENTS_CONSISTENT, 0600, &error))
+    {
+      g_warning ("elan0c7f: could not save the %s: %s", what,
+                 error ? error->message : g_strerror (errno));
+      return FALSE;
+    }
+  return TRUE;
+}
+
+static gboolean
+store_mosaic_file (const gchar *path, const E0c7fMosaic *m, guint learned)
+{
+  g_autoptr(GByteArray) out = g_byte_array_new ();
+  MosaicHeader h = { MOSAIC_MAGIC, m->w, m->h, learned };
+
+  g_byte_array_append (out, (const guint8 *) &h, sizeof h);
+  g_byte_array_append (out, m->img, m->w * m->h);
+  g_byte_array_append (out, m->weight, m->w * m->h);
+  return store_private (path, out, "learned mosaic");
+}
+
+/* the mosaic of print as learning has updated it, or NULL */
+static E0c7fMosaic *
+load_learned_mosaic (FpPrint *print, guint *learned)
+{
+  g_autofree gchar *path = learned_file (print, "mosaic");
+
+  return path ? load_mosaic_file (path, learned) : NULL;
+}
+
+/* ---- library of good presses ------------------------------------------ */
+
+typedef struct
+{
+  guint32 magic, count, next;
+} LibraryHeader;
+
+typedef struct
+{
+  guint8        placed; /* already blended into the learned mosaic */
+  guint8        pad[3];
+  E0c7fTemplate t;
+} LibraryPress;
+
+static GArray *
+load_library (const gchar *path, guint *next)
+{
+  g_autofree gchar *contents = NULL;
+  GArray *out = g_array_new (FALSE, FALSE, sizeof (LibraryPress));
+  LibraryHeader h;
+  gsize len;
+
+  *next = 0;
+  if (!g_file_get_contents (path, &contents, &len, NULL) || len < sizeof h)
+    return out;
+  memcpy (&h, contents, sizeof h);
+  if (h.magic != LIBRARY_MAGIC || h.count > LIBRARY_SLOTS ||
+      len != sizeof h + h.count * sizeof (LibraryPress))
+    return out;
+  g_array_append_vals (out, contents + sizeof h, h.count);
+  *next = h.next % LIBRARY_SLOTS;
+  return out;
+}
+
+static gboolean
+store_library (const gchar *path, GArray *lib, guint next)
+{
+  g_autoptr(GByteArray) out = g_byte_array_new ();
+  LibraryHeader h = { LIBRARY_MAGIC, lib->len, next };
+
+  g_byte_array_append (out, (const guint8 *) &h, sizeof h);
+  g_byte_array_append (out, (const guint8 *) lib->data, lib->len * sizeof (LibraryPress));
+  return store_private (path, out, "press library");
+}
+
+/* add a press, replacing the oldest once the library is full */
+static void
+library_add (GArray *lib, guint *next, const E0c7fTemplate *t, gboolean placed)
+{
+  LibraryPress p = { .placed = placed, .t = *t };
+
+  if (lib->len < LIBRARY_SLOTS)
+    g_array_append_val (lib, p);
+  else
+    {
+      g_array_index (lib, LibraryPress, *next) = p;
+      *next = (*next + 1) % LIBRARY_SLOTS;
+    }
+}
+
+/* fit in the presses that are still waiting, as enrollment does: retry
+ * until no more fit. Returns how many were fitted. */
+static guint
+refit_waiting (E0c7fMosaic *m, GArray *lib)
+{
+  guint fitted = 0;
+  E0c7fPlace at;
+
+  for (gboolean grew = TRUE; grew;)
+    {
+      grew = FALSE;
+      for (guint i = 0; i < lib->len; i++)
+        {
+          LibraryPress *p = &g_array_index (lib, LibraryPress, i);
+          if (p->placed ||
+              e0c7f_mosaic_match (m, &p->t, E0C7F_STITCH_OVERLAP, &at) < E0C7F_STITCH_MIN)
+            continue;
+          e0c7f_mosaic_add (m, &p->t, &at);
+          p->placed = 1;
+          fitted++;
+          grew = TRUE;
+        }
+    }
+  return fitted;
+}
+
+static guint
+library_waiting (GArray *lib)
+{
+  guint n = 0;
+
+  for (guint i = 0; i < lib->len; i++)
+    n += !g_array_index (lib, LibraryPress, i).placed;
+  return n;
 }
 
 typedef struct
@@ -640,58 +995,131 @@ store_learned (FpPrint *print, const E0c7fTemplate *probe)
   return slot;
 }
 
-/* append the templates stored in print, then its learned ones, to
- * templates/owners/learned */
-static gboolean
-add_print_templates (FpPrint *print, GArray *templates, GPtrArray *owners, GByteArray *learned)
+static void
+add_template (MatchJob *job, FpPrint *print, const E0c7fTemplate *t, guint8 learned)
 {
-  g_autoptr(GArray) extra = NULL;
-  const guint8 yes = 1, no = 0;
-  guint next;
+  g_array_append_vals (job->templates, t, 1);
+  g_ptr_array_add (job->owners, print);
+  g_byte_array_append (job->learned, &learned, 1);
+}
+
+static void
+add_mosaic (MatchJob *job, FpPrint *print, E0c7fMosaic *m, guint8 learned)
+{
+  g_ptr_array_add (job->mosaics, m);
+  g_ptr_array_add (job->mosaic_owners, print);
+  g_byte_array_append (job->mosaic_learned, &learned, 1);
+}
+
+/* add what print holds to the job: for a mosaic print its mosaic, the
+ * learned one if there is one, and the presses that could not be
+ * stitched; for an older print its presses and learned templates */
+static gboolean
+add_print_templates (FpPrint *print, MatchJob *job)
+{
   g_autoptr(GVariant) data = NULL;
   g_autoptr(GVariant) list = NULL;
+  g_autoptr(GVariant) stitched_v = NULL;
+  g_autoptr(GVariant) mosaic_v = NULL;
+  const guint8 *stitched = NULL;
+  gsize nstitched = 0;
+  E0c7fMosaic *mosaic = NULL;
   guint16 version, w, h;
   GVariantIter iter;
   GVariant *img, *mask;
+  guint i = 0;
 
   g_object_get (print, "fpi-data", &data, NULL);
-  if (!data || !g_variant_is_of_type (data, G_VARIANT_TYPE ("(qqqa(ayay))")))
+  if (data && g_variant_is_of_type (data, G_VARIANT_TYPE ("(qqqa(ayay))")))
+    g_variant_get (data, "(qqq@a(ayay))", &version, &w, &h, &list);
+  else if (data && g_variant_is_of_type (data, G_VARIANT_TYPE ("(qqqa(ayay)ay(qqayay))")))
+    {
+      g_variant_get (data, "(qqq@a(ayay)@ay@(qqayay))", &version, &w, &h, &list,
+                     &stitched_v, &mosaic_v);
+      stitched = g_variant_get_fixed_array (stitched_v, &nstitched, 1);
+      if (version != PRINT_VERSION_MOSAIC ||
+          nstitched != g_variant_n_children (list) ||
+          !(mosaic = mosaic_from_variant (mosaic_v)))
+        return FALSE;
+    }
+  else
     return FALSE;
-  g_variant_get (data, "(qqq@a(ayay))", &version, &w, &h, &list);
-  if (version != PRINT_VERSION || w != E0C7F_W || h != E0C7F_H)
-    return FALSE;
+  if ((!mosaic && version != PRINT_VERSION_PRESSES) || w != E0C7F_W || h != E0C7F_H)
+    {
+      e0c7f_mosaic_free (mosaic);
+      return FALSE;
+    }
 
   g_variant_iter_init (&iter, list);
-  while (g_variant_iter_next (&iter, "(@ay@ay)", &img, &mask))
+  for (; g_variant_iter_next (&iter, "(@ay@ay)", &img, &mask); i++)
     {
       E0c7fTemplate t;
       gsize ilen, mlen;
       const guint8 *ip = g_variant_get_fixed_array (img, &ilen, 1);
       const guint8 *mp = g_variant_get_fixed_array (mask, &mlen, 1);
 
-      if (ilen == E0C7F_PIXELS && mlen == E0C7F_PIXELS)
+      /* stitched presses are already in the mosaic */
+      if (ilen == E0C7F_PIXELS && mlen == E0C7F_PIXELS && !(stitched && stitched[i]))
         {
           memcpy (t.img, ip, E0C7F_PIXELS);
           memcpy (t.mask, mp, E0C7F_PIXELS);
-          g_array_append_val (templates, t);
-          g_ptr_array_add (owners, print);
-          g_byte_array_append (learned, &no, 1);
+          add_template (job, print, &t, 0);
         }
       g_variant_unref (img);
       g_variant_unref (mask);
     }
 
-  extra = load_learned (print, &next);
-  for (guint i = 0; i < extra->len; i++)
+  if (mosaic)
     {
-      g_array_append_val (templates, g_array_index (extra, E0c7fTemplate, i));
-      g_ptr_array_add (owners, print);
-      g_byte_array_append (learned, &yes, 1);
+      E0c7fMosaic *learned = load_learned_mosaic (print, NULL);
+
+      add_mosaic (job, print, mosaic, 0);
+      if (learned)
+        add_mosaic (job, print, learned, 1);
+    }
+  else
+    {
+      g_autoptr(GArray) extra = NULL;
+      guint next;
+
+      extra = load_learned (print, &next);
+      for (guint k = 0; k < extra->len; k++)
+        add_template (job, print, &g_array_index (extra, E0c7fTemplate, k), 1);
     }
   return TRUE;
 }
 
 /* ---- enroll / verify / identify --------------------------------------- */
+
+/* best score per print of the job: templates and mosaics */
+static double
+print_best (MatchJob *job, FpPrint *print)
+{
+  double best = -1;
+
+  for (guint i = 0; i < job->templates->len; i++)
+    if (g_ptr_array_index (job->owners, i) == print)
+      best = MAX (best, job->scores[i]);
+  for (guint i = 0; i < job->mosaics->len; i++)
+    if (g_ptr_array_index (job->mosaic_owners, i) == print)
+      best = MAX (best, job->mosaic_scores[i]);
+  return best;
+}
+
+/* the bar the best print must reach: stricter for a mosaic print */
+static double
+match_threshold (MatchJob *job)
+{
+  if (job->best_print && g_ptr_array_find (job->mosaic_owners, job->best_print, NULL))
+    return E0C7F_MOSAIC_THRESHOLD;
+  return E0C7F_MATCH_THRESHOLD;
+}
+
+static gboolean
+is_match (MatchJob *job)
+{
+  return job->best_print && job->best_score >= match_threshold (job);
+}
 
 /* "right-index-finger 0.62, left-index-finger 0.41" style summary */
 static gchar *
@@ -699,41 +1127,150 @@ describe_scores (MatchJob *job)
 {
   g_autoptr(GString) out = g_string_new (NULL);
   g_autoptr(GEnumClass) fingers = g_type_class_ref (FP_TYPE_FINGER);
+  g_autoptr(GPtrArray) prints = g_ptr_array_new ();
 
   if (!job->scores)
     return g_strdup ("none");
 
+  for (guint i = 0; i < job->mosaic_owners->len; i++)
+    if (!g_ptr_array_find (prints, g_ptr_array_index (job->mosaic_owners, i), NULL))
+      g_ptr_array_add (prints, g_ptr_array_index (job->mosaic_owners, i));
   for (guint i = 0; i < job->owners->len; i++)
+    if (!g_ptr_array_find (prints, g_ptr_array_index (job->owners, i), NULL))
+      g_ptr_array_add (prints, g_ptr_array_index (job->owners, i));
+
+  for (guint i = 0; i < prints->len; i++)
     {
-      FpPrint *print = g_ptr_array_index (job->owners, i);
-      double best = -1;
-      GEnumValue *name;
+      FpPrint *print = g_ptr_array_index (prints, i);
+      GEnumValue *name = g_enum_get_value (fingers, fp_print_get_finger (print));
 
-      /* report each print once, at its first template */
-      if (i > 0 && g_ptr_array_index (job->owners, i - 1) == print)
-        continue;
-      for (guint j = i; j < job->owners->len && g_ptr_array_index (job->owners, j) == print; j++)
-        best = MAX (best, job->scores[j]);
-
-      name = g_enum_get_value (fingers, fp_print_get_finger (print));
       g_string_append_printf (out, "%s%s %.3f", out->len ? ", " : "",
-                              name ? name->value_nick : "unknown", best);
+                              name ? name->value_nick : "unknown", print_best (job, print));
     }
   return g_string_free (g_steal_pointer (&out), FALSE);
 }
 
+static const char *
+finger_name (FpPrint *print)
+{
+  g_autoptr(GEnumClass) fingers = g_type_class_ref (FP_TYPE_FINGER);
+  GEnumValue *name = g_enum_get_value (fingers, fp_print_get_finger (print));
+
+  /* nicks are static strings owned by the enum type */
+  return name ? name->value_nick : "unknown";
+}
+
+/* Learning into a mosaic print, done in a thread of its own so an unlock
+ * never waits for it. Everything it needs is copied, since the print is
+ * freed once the unlock completes. */
+typedef struct
+{
+  gchar         *mosaic_path, *library_path;
+  const char    *finger;
+  E0c7fMosaic   *enrolled; /* to start from if nothing was learned yet */
+  GArray        *loose;    /* enrolled presses that never stitched */
+  E0c7fTemplate  probe;
+} LearnWork;
+
+static GMutex learn_lock; /* one learner at a time per process */
+static gboolean learn_in_background = TRUE; /* the tests learn in place */
+
+static void
+learn_work_free (LearnWork *w)
+{
+  g_free (w->mosaic_path);
+  g_free (w->library_path);
+  e0c7f_mosaic_free (w->enrolled);
+  g_array_unref (w->loose);
+  g_free (w);
+}
+
+static gpointer
+learn_work_run (gpointer data)
+{
+  LearnWork *w = data;
+  g_autoptr(GArray) lib = NULL;
+  E0c7fMosaic *m;
+  E0c7fPlace at;
+  guint learned = 0, next, fitted = 0;
+  int added = 0;
+  gboolean placed;
+
+  g_mutex_lock (&learn_lock);
+  /* placed on the mosaic as it is now: another press may have been learned
+   * since this one was matched */
+  m = load_mosaic_file (w->mosaic_path, &learned);
+  if (!m)
+    m = e0c7f_mosaic_copy (w->enrolled);
+  lib = load_library (w->library_path, &next);
+  if (lib->len == 0)
+    for (guint i = 0; i < w->loose->len; i++)
+      library_add (lib, &next, &g_array_index (w->loose, E0c7fTemplate, i), FALSE);
+
+  placed = e0c7f_mosaic_match (m, &w->probe, E0C7F_MATCH_OVERLAP, &at) >= LEARN_MIN_MOSAIC_SCORE;
+  if (placed)
+    {
+      added = e0c7f_mosaic_add (m, &w->probe, &at);
+      learned++;
+      /* a grown mosaic may now reach presses that did not fit before */
+      if (added > 0)
+        fitted = refit_waiting (m, lib);
+    }
+  library_add (lib, &next, &w->probe, placed);
+
+  if (placed)
+    store_mosaic_file (w->mosaic_path, m, learned);
+  if (store_library (w->library_path, lib, next))
+    {
+      if (placed)
+        E0C7F_SCORE_LOG ("elan0c7f: learned this press into the %s mosaic (%d new px, "
+                         "%d px known, %u presses learned); %u waiting presses fitted in, "
+                         "%u still waiting", w->finger, added, e0c7f_mosaic_area (m),
+                         learned, fitted, library_waiting (lib));
+      else
+        E0C7F_SCORE_LOG ("elan0c7f: kept this press for %s to fit in later "
+                         "(%u waiting)", w->finger, library_waiting (lib));
+    }
+  g_mutex_unlock (&learn_lock);
+  e0c7f_mosaic_free (m);
+  learn_work_free (w);
+  return NULL;
+}
+
+static void
+learn_into_mosaic (MatchJob *job, guint enrolled_idx)
+{
+  FpPrint *print = g_ptr_array_index (job->mosaic_owners, enrolled_idx);
+  LearnWork *w = g_new0 (LearnWork, 1);
+
+  w->mosaic_path = learned_file (print, "mosaic");
+  w->library_path = learned_file (print, "presses");
+  w->finger = finger_name (print);
+  w->enrolled = e0c7f_mosaic_copy (g_ptr_array_index (job->mosaics, enrolled_idx));
+  w->probe = job->probe;
+  w->loose = g_array_new (FALSE, FALSE, sizeof (E0c7fTemplate));
+  for (guint i = 0; i < job->templates->len; i++)
+    if (g_ptr_array_index (job->owners, i) == print && !job->learned->data[i])
+      g_array_append_vals (w->loose, &g_array_index (job->templates, E0c7fTemplate, i), 1);
+
+  if (learn_in_background)
+    g_thread_unref (g_thread_new ("elan0c7f-learn", learn_work_run, w));
+  else
+    learn_work_run (w);
+}
+
 /* after a match: learn the press if it is clearly this finger (see
- * LEARN_DIR for the safeguards) */
+ * LEARN_DIR for the safeguards). A mosaic print blends it into its learned
+ * mosaic; an older print keeps it as a learned template. */
 static void
 maybe_learn (MatchJob *job)
 {
-  g_autoptr(GEnumClass) fingers = NULL;
   double enrolled = -1, same = -1, other = -1;
-  GEnumValue *name;
+  int target = -1; /* the print's enrolled mosaic, if it has one */
   guint slot;
 
   if (job->action == FPI_DEVICE_ACTION_ENROLL || !job->probe_ok || !job->scores ||
-      !job->best_print || job->best_score < E0C7F_MATCH_THRESHOLD)
+      !is_match (job))
     return;
   for (guint i = 0; i < job->templates->len; i++)
     {
@@ -744,19 +1281,111 @@ maybe_learn (MatchJob *job)
       else
         enrolled = MAX (enrolled, job->scores[i]);
     }
+  for (guint i = 0; i < job->mosaics->len; i++)
+    {
+      if (g_ptr_array_index (job->mosaic_owners, i) != job->best_print)
+        other = MAX (other, job->mosaic_scores[i]);
+      else if (job->mosaic_learned->data[i])
+        same = MAX (same, job->mosaic_scores[i]);
+      else
+        {
+          enrolled = MAX (enrolled, job->mosaic_scores[i]);
+          target = i;
+        }
+    }
   same = MAX (same, enrolled);
-  if (enrolled < LEARN_MIN_SCORE || same > LEARN_MAX_SCORE ||
+  if (enrolled < (target >= 0 ? LEARN_MIN_MOSAIC_SCORE : LEARN_MIN_SCORE) ||
       enrolled - other < LEARN_MIN_MARGIN ||
       job->coverage < LEARN_MIN_COVERAGE || job->clarity < LEARN_MIN_CLARITY)
     return;
 
+  if (target >= 0)
+    {
+      learn_into_mosaic (job, target);
+      return;
+    }
+
+  if (same > LEARN_MAX_SCORE)
+    return;
   slot = store_learned (job->best_print, &job->probe);
   if (slot == G_MAXUINT)
     return;
-  fingers = g_type_class_ref (FP_TYPE_FINGER);
-  name = g_enum_get_value (fingers, fp_print_get_finger (job->best_print));
   E0C7F_SCORE_LOG ("elan0c7f: learned this press for %s (slot %u of %u)",
-                   name ? name->value_nick : "unknown", slot + 1, LEARN_SLOTS);
+                   finger_name (job->best_print), slot + 1, LEARN_SLOTS);
+}
+
+/* keep the raw frames of an enrollment press (E0C7F_SAVE_SAMPLES builds),
+ * in the layout the offline tools read: press-NN/raw-KKK.bin */
+static void
+save_sample (FpiDeviceElan0c7f *self, MatchJob *job, guint n)
+{
+  g_autofree gchar *dir = NULL;
+
+  if (!self->samples_dir)
+    return;
+  dir = g_strdup_printf ("%s/press-%02u", self->samples_dir, n);
+  if (g_mkdir_with_parents (dir, 0700) < 0)
+    {
+      g_warning ("elan0c7f: could not save enrollment samples in %s", dir);
+      return;
+    }
+  for (int f = 0; f < job->nframes; f++)
+    {
+      g_autofree gchar *path = g_strdup_printf ("%s/raw-%03d.bin", dir, f);
+      g_file_set_contents_full (path, (const gchar *) (job->frames + f * E0C7F_PIXELS),
+                                E0C7F_PIXELS * sizeof (guint16), G_FILE_SET_CONTENTS_NONE,
+                                0600, NULL);
+    }
+}
+
+/* and of every unlock press, named by time, finger and score, so misses
+ * can be studied later: unlocks/<date>/<time>-<finger>-<score>/raw-KKK.bin */
+static void
+save_unlock_press (MatchJob *job, double threshold)
+{
+#ifdef E0C7F_SAVE_SAMPLES
+  g_autoptr(GDateTime) now = g_date_time_new_now_local ();
+  g_autofree gchar *day = g_date_time_format (now, "%Y%m%d");
+  g_autofree gchar *time = g_date_time_format (now, "%H%M%S-%f");
+  g_autofree gchar *dir = g_strdup_printf ("%s/unlocks/%s/%s-%s-%.3f-%s", SAMPLES_DIR, day, time,
+                                           job->best_print ? finger_name (job->best_print) : "none",
+                                           job->best_score,
+                                           !job->probe_ok ? "unreadable" :
+                                           job->best_score >= threshold ? "match" : "nomatch");
+
+  if (g_mkdir_with_parents (dir, 0700) < 0)
+    return;
+  for (int f = 0; f < job->nframes; f++)
+    {
+      g_autofree gchar *path = g_strdup_printf ("%s/raw-%03d.bin", dir, f);
+      g_file_set_contents_full (path, (const gchar *) (job->frames + f * E0C7F_PIXELS),
+                                E0C7F_PIXELS * sizeof (guint16), G_FILE_SET_CONTENTS_NONE,
+                                0600, NULL);
+    }
+#endif
+}
+
+/* and a picture of the finished mosaic: mosaic.pgm, unknown parts black */
+static void
+save_mosaic_picture (FpiDeviceElan0c7f *self)
+{
+  const E0c7fMosaic *m = self->enroll_mosaic;
+  g_autofree gchar *path = NULL;
+  g_autoptr(GByteArray) out = g_byte_array_new ();
+  g_autofree gchar *header = NULL;
+
+  if (!self->samples_dir || !m)
+    return;
+  header = g_strdup_printf ("P5\n%d %d\n255\n", m->w, m->h);
+  g_byte_array_append (out, (const guint8 *) header, strlen (header));
+  for (int i = 0; i < m->w * m->h; i++)
+    {
+      guint8 v = m->weight[i] ? MAX (m->img[i], 1) : 0;
+      g_byte_array_append (out, &v, 1);
+    }
+  path = g_build_filename (self->samples_dir, "mosaic.pgm", NULL);
+  g_file_set_contents_full (path, (const gchar *) out->data, out->len,
+                            G_FILE_SET_CONTENTS_NONE, 0600, NULL);
 }
 
 static void
@@ -773,69 +1402,105 @@ report_match (FpDevice *dev, MatchJob *job)
    * for measuring accuracy; normal builds keep them at debug level, since
    * exposing scores helps anyone trying to fool the matcher */
   E0C7F_SCORE_LOG ("elan0c7f: %s: %d frames, coverage %.2f, clarity %.2f, probe %s, "
-             "%u templates, best %.3f (threshold %.3f): %s",
+             "%u templates, %u mosaics, best %.3f (threshold %.3f): %s",
              job->action == FPI_DEVICE_ACTION_ENROLL ? "enroll" :
              job->action == FPI_DEVICE_ACTION_VERIFY ? "verify" : "identify",
              job->nframes, job->coverage, job->clarity, job->probe_ok ? "ok" : "rejected",
-             job->templates ? job->templates->len : 0,
-             job->best_score, E0C7F_MATCH_THRESHOLD, scores);
+             job->templates->len, job->mosaics->len,
+             job->best_score, match_threshold (job), scores);
 
   switch (job->action)
     {
     case FPI_DEVICE_ACTION_ENROLL:
-      /* ask for the same spot again if the press was half-on or unclear,
-       * but only a couple of times so enrollment can't get stuck */
-      if (!retry && self->spot_retries < MAX_SPOT_RETRIES)
-        {
-          if (job->coverage < MIN_PRESS_COVERAGE)
-            retry = fpi_device_retry_new (FP_DEVICE_RETRY_CENTER_FINGER);
-          else if (job->clarity < MIN_ENROLL_CLARITY)
-            retry = fpi_device_retry_new (FP_DEVICE_RETRY_GENERAL);
-        }
-      if (retry)
-        {
-          self->spot_retries++;
-          fpi_device_enroll_progress (dev, self->enroll_templates->len, NULL, retry);
-          start_capture (dev);
-          return;
-        }
-      self->spot_retries = 0;
-      g_array_append_val (self->enroll_templates, job->probe);
-      fpi_device_enroll_progress (dev, self->enroll_templates->len, NULL, NULL);
-      if (self->enroll_templates->len < NR_ENROLL_STAGES)
-        {
-          start_capture (dev);
-          return;
-        }
-      fpi_device_get_enroll_data (dev, &print);
-      fpi_print_set_type (print, FPI_PRINT_RAW);
-      g_object_set (print, "fpi-data", templates_to_variant (self->enroll_templates), NULL);
-      g_clear_pointer (&self->enroll_templates, g_array_unref);
-      fpi_device_enroll_complete (dev, g_object_ref (print), NULL);
+      {
+        int why = enroll_retry (job);
+        gboolean repeat, done;
+        guint n, aside = 0;
+        int area;
+
+        g_clear_error (&retry);
+        /* the thread is done with the enrollment so far: take it back */
+        self->enroll_templates = g_steal_pointer (&job->enroll_templates);
+        self->enroll_stitched = g_steal_pointer (&job->enroll_stitched);
+        self->enroll_mosaic = g_steal_pointer (&job->enroll_mosaic);
+        if (why < 0 && job->enroll_too_far)
+          {
+            E0C7F_SCORE_LOG ("elan0c7f: enroll press too far from the finger so far "
+                             "(fit %.3f, needs %.2f): asking again", job->enroll_fit,
+                             E0C7F_STITCH_MIN);
+            self->enroll_misses++;
+            fpi_device_enroll_progress (dev, self->enroll_templates->len, NULL,
+                                        fpi_device_retry_new (FP_DEVICE_RETRY_REMOVE_FINGER));
+            start_capture (dev);
+            return;
+          }
+        if (why >= 0)
+          {
+            self->spot_retries++;
+            fpi_device_enroll_progress (dev, self->enroll_templates->len, NULL,
+                                        fpi_device_retry_new (why));
+            start_capture (dev);
+            return;
+          }
+        self->spot_retries = 0;
+        self->enroll_misses = 0;
+        n = self->enroll_templates->len;
+        area = e0c7f_mosaic_area (self->enroll_mosaic);
+        for (guint i = 0; i < n; i++)
+          aside += !self->enroll_stitched->data[i];
+        save_sample (self, job, n);
+
+        /* a press that is stitched on but adds almost nothing is a repeat
+         * of a known part; one that does not fit yet may be a new part */
+        repeat = job->enroll_fits && job->enroll_added < ENROLL_REPEAT_AREA * E0C7F_PIXELS;
+        self->enroll_repeats = repeat ? self->enroll_repeats + 1 : 0;
+        done = n >= ENROLL_MAX_PRESSES ||
+               (n >= ENROLL_MIN_PRESSES && self->enroll_repeats >= ENROLL_REPEATS &&
+                area >= ENROLL_MIN_AREA * E0C7F_PIXELS && aside <= ENROLL_MAX_ASIDE);
+        E0C7F_SCORE_LOG ("elan0c7f: enroll press %u: %s, %d new px, mosaic %d px "
+                         "(%.1f presses' worth), %u aside, %u repeats in a row%s",
+                         n, job->enroll_fits ? "stitched" : "kept aside", job->enroll_added,
+                         area, (double) area / E0C7F_PIXELS, aside, self->enroll_repeats,
+                         done ? ": finger covered, done" : "");
+        fpi_device_enroll_progress (dev, n, NULL, NULL);
+        if (!done)
+          {
+            start_capture (dev);
+            return;
+          }
+        fpi_device_get_enroll_data (dev, &print);
+        fpi_print_set_type (print, FPI_PRINT_RAW);
+        g_object_set (print, "fpi-data",
+                      mosaic_print_to_variant (self->enroll_templates, self->enroll_stitched,
+                                               self->enroll_mosaic), NULL);
+        save_mosaic_picture (self);
+        enroll_state_clear (self);
+        fpi_device_enroll_complete (dev, g_object_ref (print), NULL);
+      }
       break;
 
     case FPI_DEVICE_ACTION_VERIFY:
       /* before reporting: the prints are freed once the action completes */
+      save_unlock_press (job, match_threshold (job));
       maybe_learn (job);
       if (retry)
         fpi_device_verify_report (dev, FPI_MATCH_ERROR, NULL, retry);
       else
         fpi_device_verify_report (dev,
-                                  job->best_score >= E0C7F_MATCH_THRESHOLD ?
-                                  FPI_MATCH_SUCCESS : FPI_MATCH_FAIL,
+                                  is_match (job) ? FPI_MATCH_SUCCESS : FPI_MATCH_FAIL,
                                   NULL, NULL);
       fpi_device_verify_complete (dev, NULL);
       break;
 
     case FPI_DEVICE_ACTION_IDENTIFY:
       /* before reporting: the prints are freed once the action completes */
+      save_unlock_press (job, match_threshold (job));
       maybe_learn (job);
       if (retry)
         fpi_device_identify_report (dev, NULL, NULL, retry);
       else
         fpi_device_identify_report (dev,
-                                    job->best_score >= E0C7F_MATCH_THRESHOLD ?
-                                    job->best_print : NULL,
+                                    is_match (job) ? job->best_print : NULL,
                                     NULL, NULL);
       fpi_device_identify_complete (dev, NULL);
       break;
@@ -866,13 +1531,28 @@ match_job_new (FpDevice *dev, guint16 *frames, int nframes, GError **error)
   job->templates = g_array_new (FALSE, FALSE, sizeof (E0c7fTemplate));
   job->owners = g_ptr_array_new ();
   job->learned = g_byte_array_new ();
+  job->mosaics = g_ptr_array_new_with_free_func ((GDestroyNotify) e0c7f_mosaic_free);
+  job->mosaic_owners = g_ptr_array_new ();
+  job->mosaic_learned = g_byte_array_new ();
 
-  if (action == FPI_DEVICE_ACTION_VERIFY)
+  if (action == FPI_DEVICE_ACTION_ENROLL)
+    {
+      FpiDeviceElan0c7f *self = FPI_DEVICE_ELAN0C7F (dev);
+
+      /* lent to the thread, which stitches the press on; report_match()
+       * takes them back */
+      job->enroll_templates = g_steal_pointer (&self->enroll_templates);
+      job->enroll_stitched = g_steal_pointer (&self->enroll_stitched);
+      job->enroll_mosaic = g_steal_pointer (&self->enroll_mosaic);
+      job->spot_retries = self->spot_retries;
+      job->enroll_misses = self->enroll_misses;
+    }
+  else if (action == FPI_DEVICE_ACTION_VERIFY)
     {
       FpPrint *print;
 
       fpi_device_get_verify_data (dev, &print);
-      if (!add_print_templates (print, job->templates, job->owners, job->learned))
+      if (!add_print_templates (print, job))
         {
           match_job_free (job);
           g_set_error_literal (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_DATA_INVALID,
@@ -886,8 +1566,7 @@ match_job_new (FpDevice *dev, guint16 *frames, int nframes, GError **error)
 
       fpi_device_get_identify_data (dev, &prints);
       for (guint i = 0; i < prints->len; i++)
-        add_print_templates (g_ptr_array_index (prints, i), job->templates, job->owners,
-                             job->learned);
+        add_print_templates (g_ptr_array_index (prints, i), job);
     }
   return job;
 }
@@ -941,7 +1620,7 @@ capture_done (FpiSsm *ssm, FpDevice *dev, GError *error)
                                            FP_FINGER_STATUS_PRESENT | FP_FINGER_STATUS_NEEDED);
   if (error)
     {
-      g_clear_pointer (&self->enroll_templates, g_array_unref);
+      enroll_state_clear (self);
       fpi_device_action_error (dev, error);
       return;
     }
@@ -981,9 +1660,22 @@ dev_enroll (FpDevice *dev)
 {
   FpiDeviceElan0c7f *self = FPI_DEVICE_ELAN0C7F (dev);
 
-  g_clear_pointer (&self->enroll_templates, g_array_unref);
+  enroll_state_clear (self);
   self->enroll_templates = g_array_new (FALSE, FALSE, sizeof (E0c7fTemplate));
+  self->enroll_stitched = g_byte_array_new ();
+  self->enroll_repeats = 0;
+  self->enroll_misses = 0;
   self->spot_retries = 0;
+#ifdef E0C7F_SAVE_SAMPLES
+  {
+    g_autoptr(GDateTime) now = g_date_time_new_now_local ();
+    g_autofree gchar *stamp = g_date_time_format (now, "%Y%m%d-%H%M%S");
+    FpPrint *print;
+
+    fpi_device_get_enroll_data (dev, &print);
+    self->samples_dir = g_strdup_printf ("%s/%s-%s", SAMPLES_DIR, finger_name (print), stamp);
+  }
+#endif
   start_capture (dev);
 }
 
